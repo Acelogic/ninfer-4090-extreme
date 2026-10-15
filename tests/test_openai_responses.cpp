@@ -551,6 +551,44 @@ int test_tools_and_effective_subset() {
     return failures;
 }
 
+// A tool set that comes back in another order renders in the order it was first seen in (prompt prefix stability).
+int test_stable_tool_order() {
+    int failures = 0;
+    const auto tool_names = [](const std::string& body) {
+        const OpenAIResponsesCreateRequest request =
+            parse_openai_responses_create_request(Json::parse(body), limits());
+        const ninfer::PromptInput prompt =
+            to_prompt_input(request.prompt.generation, ResolvedPromptSemantics{}, {});
+        std::vector<std::string> names;
+        for (const std::string& tool : prompt.options.tool_jsons) {
+            names.push_back(Json::parse(tool)["function"]["name"].get<std::string>());
+        }
+        return names;
+    };
+    const auto body = [](const std::vector<std::string>& names) {
+        Json tools = Json::array();
+        for (const std::string& name : names) {
+            tools.push_back({{"type", "function"}, {"name", name}, {"parameters", {{"type", "object"}}}});
+        }
+        return Json{{"model", "m"}, {"input", "probe"}, {"tools", tools}}.dump();
+    };
+    const std::vector<std::string> first = {"order_probe_read", "order_probe_write", "order_probe_shell"};
+    failures += check(tool_names(body(first)) == first, "the first request of a tool set did not keep its order");
+    const std::vector<std::string> reordered =
+        tool_names(body({"order_probe_shell", "order_probe_read", "order_probe_write"}));
+    if (reordered != first) {
+        std::string got;
+        for (const std::string& name : reordered) { got += name + " "; }
+        std::cerr << "reordered tool set rendered as: " << got << '\n';
+    }
+    failures += check(reordered == first, "a reordered tool set was not put back in its first order");
+    const std::vector<std::string> other = {"order_probe_shell", "order_probe_read"};
+    failures += check(tool_names(body(other)) == other, "a different tool set was reordered");
+    const std::vector<std::string> grown = {"order_probe_new", "order_probe_read", "order_probe_write", "order_probe_shell"};
+    failures += check(tool_names(body(grown)) == grown, "a tool set with an added tool was reordered");
+    return failures;
+}
+
 int test_namespace_tools() {
     const Json clock_namespace = {
         {"type", "namespace"},
@@ -991,6 +1029,7 @@ int main() {
     failures += test_response_output_history_round_trip();
     failures += test_assistant_item_boundaries_and_errors();
     failures += test_tools_and_effective_subset();
+    failures += test_stable_tool_order();
     failures += test_namespace_tools();
     failures += test_explicit_rejections();
     failures += test_previous_response_call_graph();

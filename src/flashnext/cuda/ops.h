@@ -145,8 +145,11 @@ void moe_slots(const std::int32_t * ids, const std::int32_t * map, std::int32_t 
 // Assigns the T * 10 selected experts: slots[i] = the VRAM cache slot (or -1); of the rest, the first
 // zc_permille / 1000 of them (rounded) are read by the GPU straight from host memory (host_slots[i] =
 // expert id, else -1) and the others go to the CPU (on_cpu[i] = 1).
+// Tail skip (tail_rank in 1..9, 0 = off; changes the output): a missed expert that every token of the step
+// routes only at rank >= tail_rank (the smallest weights of its top-10) is computed nowhere (on_cpu[i] = 2):
+// it contributes zero, and the other experts keep the weight the router gave them (no renormalisation).
 void moe_plan(const std::int32_t * ids, const std::int32_t * map, std::int32_t * slots, std::int32_t * host_slots, std::uint8_t * on_cpu,
-              int T, int zc_permille, cudaStream_t s);
+              int T, int zc_permille, int tail_rank, cudaStream_t s);
 // out = (gpu + cpu) + shared * sigmoid(shared_gate_logit[t]), with gpu already summed per token (cpu may be null: zeros)
 void moe_combine_sum(const float * gpu, const float * cpu, const float * shared, const float * shared_gate, float * out, int T,
                      cudaStream_t s);
@@ -166,7 +169,7 @@ struct alignas(64) ExpertLink {
     std::int64_t pad1[7];
     std::int32_t ids[kMaxTokens * kUsed];
     float weights[kMaxTokens * kUsed];
-    std::uint8_t on_cpu[kMaxTokens * kUsed];  // the pairs the CPU computes (the GPU takes the rest)
+    std::uint8_t on_cpu[kMaxTokens * kUsed];  // 1: the pairs the CPU computes, 2: tail-skipped (nobody); 0: the GPU's
     float x[kMaxTokens * kEmbd];
     float out[kMaxTokens * kEmbd];
 };

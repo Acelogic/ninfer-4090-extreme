@@ -3,12 +3,16 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <list>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -87,12 +91,77 @@ ninfer::SamplingOverrides resolve_sampling_overrides(const SamplingParams& reque
     return sampling;
 }
 
-std::vector<const ToolDefinition*> effective_tools(const GenerationRequest& request) {
+// Clients send their tools in the order their tool servers (MCP) finished registering, which can change from one
+// request or client restart to the next, and the template renders the tools before the conversation: one swap moves
+// the shared prompt prefix back to its start and the whole conversation (often 100K+ tokens) is read again. So a set
+// of tool names keeps the order it was first seen in: the first request of a set renders exactly as sent, later ones
+// with the same names in another order are put back in that first order. Duplicate names and a single tool are left as
+// sent. Cache boundaries are positions in the tool list (the automatic one follows the last tool), so they stay where
+// they were while the tools move (EffectiveTool). After Strata 1a62f6df (#1624).
+class ToolOrderMemory {
+public:
+    void stabilize(std::vector<const ToolDefinition*>& tools) {
+        if (tools.size() < 2) { return; }
+        std::vector<std::string> names;
+        names.reserve(tools.size());
+        for (const ToolDefinition* tool : tools) { names.push_back(tool->name); }
+        std::vector<std::string> key = names;
+        std::sort(key.begin(), key.end());
+        if (std::adjacent_find(key.begin(), key.end()) != key.end()) { return; }
+        std::vector<std::string> order;
+        {
+            const std::lock_guard lock(mutex_);
+            const auto it = std::find_if(entries_.begin(), entries_.end(),
+                                         [&](const Entry& entry) { return entry.key == key; });
+            if (it == entries_.end()) {
+                entries_.push_front(Entry{std::move(key), std::move(names)});
+                if (entries_.size() > kMaxSets) { entries_.pop_back(); }
+                return;
+            }
+            entries_.splice(entries_.begin(), entries_, it); // most recently used first
+            order = entries_.front().order;
+        }
+        if (order == names) { return; }
+        std::unordered_map<std::string, std::size_t> position;
+        for (std::size_t index = 0; index < order.size(); ++index) { position.emplace(order[index], index); }
+        std::sort(tools.begin(), tools.end(), [&](const ToolDefinition* a, const ToolDefinition* b) {
+            return position.at(a->name) < position.at(b->name);
+        });
+    }
+
+private:
+    struct Entry {
+        std::vector<std::string> key;   // the names, sorted
+        std::vector<std::string> order; // the order they were first seen in
+    };
+    static constexpr std::size_t kMaxSets = 64;
+    std::mutex mutex_;
+    std::list<Entry> entries_;
+};
+
+ToolOrderMemory& tool_order_memory() {
+    static ToolOrderMemory memory;
+    return memory;
+}
+
+// A tool in render order, and the cache boundary at its position (the request's boundary after its index-th tool).
+struct EffectiveTool {
+    const ToolDefinition* tool = nullptr;
+    const std::optional<CacheBoundary>* boundary_after = nullptr;
+};
+
+std::vector<EffectiveTool> effective_tools(const GenerationRequest& request) {
+    std::vector<EffectiveTool> result;
+    if (!request.uses_tools()) { return result; }
     std::vector<const ToolDefinition*> tools;
-    if (!request.uses_tools()) { return tools; }
     tools.reserve(request.tools.size());
     for (const ToolDefinition& tool : request.tools) { tools.push_back(&tool); }
-    return tools;
+    tool_order_memory().stabilize(tools);
+    result.reserve(tools.size());
+    for (std::size_t index = 0; index < tools.size(); ++index) {
+        result.push_back({tools[index], &request.tools[index].cache_boundary_after});
+    }
+    return result;
 }
 
 std::string render_tool_definition(const ToolDefinition& tool) {
@@ -287,14 +356,14 @@ ninfer::PromptInput to_prompt_input(const GenerationRequest& request,
     input.options.preserve_thinking                = semantics.preserve_thinking;
     input.options.chat_template_kwargs_json        = semantics.chat_template_kwargs_json;
     input.options.add_vision_id                    = false;
-    const std::vector<const ToolDefinition*> tools = effective_tools(request);
+    const std::vector<EffectiveTool> tools = effective_tools(request);
     input.options.tool_jsons.reserve(tools.size());
     for (std::size_t index = 0; index < tools.size(); ++index) {
-        input.options.tool_jsons.push_back(render_tool_definition(*tools[index]));
-        if (tools[index]->cache_boundary_after) {
+        input.options.tool_jsons.push_back(render_tool_definition(*tools[index].tool));
+        if (const std::optional<CacheBoundary>& boundary = *tools[index].boundary_after) {
             input.context_cache.markers.push_back(ninfer::PromptCacheMarker{
-                .kind             = tools[index]->cache_boundary_after->kind,
-                .evidence         = tools[index]->cache_boundary_after->evidence,
+                .kind             = boundary->kind,
+                .evidence         = boundary->evidence,
                 .location         = ninfer::PromptCacheMarkerLocation::ToolBoundary,
                 .after_tool_count = static_cast<std::uint32_t>(index + 1U),
             });

@@ -716,18 +716,32 @@ __global__ void k_moe_slots(const std::int32_t * __restrict__ ids, const std::in
 }
 
 __global__ void k_moe_plan(const std::int32_t * __restrict__ ids, const std::int32_t * __restrict__ map, std::int32_t * __restrict__ slots,
-                           std::int32_t * __restrict__ host_slots, std::uint8_t * __restrict__ on_cpu, int n, int zc_permille) {
+                           std::int32_t * __restrict__ host_slots, std::uint8_t * __restrict__ on_cpu, int n, int zc_permille,
+                           int tail_rank) {
     if (threadIdx.x != 0) return;
+    // Tail skip: a missed expert is skipped when its best rank over every token of the step is >= tail_rank.
+    // ids are in rank order per token (router_topk), so entry i has rank i % kUsed. n <= kMaxTokens * kUsed.
+    bool skip[kMaxTokens * kUsed];
     int misses = 0;
-    for (int i = 0; i < n; ++i) misses += map[ids[i]] < 0;
+    for (int i = 0; i < n; ++i) {
+        skip[i] = false;
+        if (map[ids[i]] >= 0) continue;
+        if (tail_rank > 0) {
+            int best = kUsed;
+            for (int j = 0; j < n; ++j)
+                if (ids[j] == ids[i]) best = min(best, j % kUsed);
+            skip[i] = best >= tail_rank;
+        }
+        misses += !skip[i];
+    }
     const int to_gpu = (misses * zc_permille + 500) / 1000;
     for (int i = 0, m = 0; i < n; ++i) {
         const int slot = map[ids[i]];
         slots[i] = slot;
-        const bool miss = slot < 0, zc = miss && m < to_gpu;
+        const bool miss = slot < 0 && !skip[i], zc = miss && m < to_gpu;
         m += miss;
         host_slots[i] = zc ? ids[i] : -1;
-        on_cpu[i] = miss && !zc;
+        on_cpu[i] = skip[i] ? 2 : (miss && !zc);
     }
 }
 
@@ -946,8 +960,9 @@ void moe_slots(const std::int32_t * ids, const std::int32_t * map, std::int32_t 
     launched("moe_slots");
 }
 void moe_plan(const std::int32_t * ids, const std::int32_t * map, std::int32_t * slots, std::int32_t * host_slots, std::uint8_t * on_cpu,
-              int T, int zc_permille, cudaStream_t s) {
-    k_moe_plan<<<1, 32, 0, s>>>(ids, map, slots, host_slots, on_cpu, T * kUsed, zc_permille);
+              int T, int zc_permille, int tail_rank, cudaStream_t s) {
+    if (T < 1 || T > kMaxTokens) throw std::runtime_error("moe_plan: T out of range");
+    k_moe_plan<<<1, 32, 0, s>>>(ids, map, slots, host_slots, on_cpu, T * kUsed, zc_permille, tail_rank > 0 && tail_rank < kUsed ? tail_rank : 0);
     launched("moe_plan");
 }
 void moe_combine_sum(const float * gpu, const float * cpu, const float * shared, const float * shared_gate, float * out, int T,

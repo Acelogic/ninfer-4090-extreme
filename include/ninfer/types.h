@@ -217,6 +217,14 @@ struct FlashNextOptions {
     // The vision encoder for image input: the model's mmproj GGUF (clip, projector qwen3vl_merger, F16). Empty serves
     // text only.
     std::filesystem::path vision_path;
+    // Tail skip for decode steps (changes the output slightly): a routed expert that is not in the VRAM cache and that
+    // every token of the step ranks only at this 0-based rank or lower (7 = the 8th to 10th of its top-10) is not
+    // computed; it contributes zero. 0 disables, 1..9 enables, negative keeps the engine's default (off).
+    std::int32_t tail_skip_rank = -1;
+    // N-gram drafts (exact; they are verified like MTP drafts): when the last n committed tokens appeared before in the
+    // prompt or the output, a decode step may draft what followed them there instead of asking the MTP head. n = this
+    // value (2..16); 0 disables. Needs the MTP head (draft_tokens).
+    std::uint32_t ngram_match_tokens = 0;
 
     [[nodiscard]] friend bool operator==(const FlashNextOptions&,
                                          const FlashNextOptions&) = default;

@@ -4,7 +4,7 @@
 //                    [--threads N] [--json out.json] [--dump dir] [--compare-ref]
 //                    [--cache-mib N] [--reserve-mib N] [--no-vram-budget] [--routing-stats file] [--no-graphs] [--prefill-chunk N]
 //                    [--no-host-images] [--gpu-miss-permille N] [--test-snapshot [--snapshot-detour N]] [--test-park] [--mtp mtp.gguf [--draft K]
-//                    [--mtp-experts-vram]] [--no-decode-adapt] [--hash]
+//                    [--mtp-experts-vram]] [--no-decode-adapt] [--tail-skip R] [--hash]
 //                    [--kv-stream 0|1] [--kv-resident CELLS] [--kv-stage-cells CELLS] [--kv-group-tokens N] [--followup N[,N...]]
 //                    [--no-lend] [--no-stream] [--stream-min N] [--chunk-max N] [--cpu-share-max N] [--dense-sgemm] [--profile]
 //                    [--hash-state] [--pieces N] [--prefill-runs 0,2048:nostream,...]
@@ -196,6 +196,7 @@ static int run(int argc, char ** argv) {
         else if (a == "--mtp") opt.mtp_path = next();
         else if (a == "--mtp-experts-vram") opt.mtp_experts_vram = true;
         else if (a == "--no-decode-adapt") opt.decode_adapt = false;
+        else if (a == "--tail-skip") opt.tail_skip_rank = std::stoi(next());
         else if (a == "--int8-cpu-experts") opt.precise_cpu_experts = false;
         else if (a == "--pin") opt.pin_cpu_threads = true;
         else if (a == "--draft") n_draft = std::stoi(next());
@@ -493,8 +494,12 @@ static int run(int argc, char ** argv) {
         const EngineStats & st = engine.stats();
         const std::int64_t hits = st.expert_hits - after_prompt.expert_hits, pairs = st.expert_pairs - after_prompt.expert_pairs;
         std::int64_t steps = 0;
-        std::printf("decode experts: %.1f%% VRAM (%lld of %lld pairs); steps by tokens:", 100.0 * double(hits) / double(std::max<std::int64_t>(1, pairs)),
+        std::printf("decode experts: %.1f%% VRAM (%lld of %lld pairs)", 100.0 * double(hits) / double(std::max<std::int64_t>(1, pairs)),
                     (long long) hits, (long long) pairs);
+        if (st.tail_skip_rank > 0)
+            std::printf(", tail skip (rank >= %d): %.1f%% of pairs not computed", st.tail_skip_rank,
+                        100.0 * double(st.expert_tail_skipped - after_prompt.expert_tail_skipped) / double(std::max<std::int64_t>(1, pairs)));
+        std::printf("; steps by tokens:");
         for (int t = 1; t <= 4; ++t) {
             const std::int64_t n = st.graph_steps[t] - after_prompt.graph_steps[t];
             steps += n;

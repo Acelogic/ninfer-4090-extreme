@@ -101,7 +101,9 @@ public:
     struct Layer;
 
 private:
-    void load_layer(const GgufModel & model, int layer);
+    // staged (optional): the layer's gate, up and down expert tensors already in memory (direct reads at load);
+    // null copies them through the GGUF mapping
+    void load_layer(const GgufModel & model, int layer, const std::uint8_t * const * staged = nullptr);
     template <bool Precise>
     void run_batch_impl(int layer, int n_tokens, const float * x, const std::int32_t * ids, const float * weights,
                         const std::uint8_t * on_cpu, float * out);

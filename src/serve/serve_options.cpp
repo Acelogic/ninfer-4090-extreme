@@ -95,7 +95,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--flashnext-expert-cache-mib N] [--flashnext-expert-threads N] "
            "[--flashnext-routing-stats FILE] [--flashnext-host-expert-images] "
            "[--flashnext-mtp FILE [--flashnext-draft K]] [--flashnext-vision FILE] "
-           "[--flashnext-park-mib N] [--flashnext-vram-reserve-mib N] "
+           "[--flashnext-park-mib N] [--flashnext-vram-reserve-mib N] [--flashnext-tail-skip R] [--flashnext-ngram N] "
            "[--temperature F] [--top-p F] [--top-k N] [--min-p F] [--presence-penalty F] "
            "[--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n"
@@ -166,7 +166,13 @@ std::string serve_usage_text(const char* argv0) {
            "would overwrite, so that a later request continuing one resumes it instead of "
            "reading it again; --flashnext-vram-reserve-mib N keeps N MiB of VRAM free for other "
            "programs (default 1024; on Windows within the OS's VRAM budget for the process: the "
-           "expert cache gives VRAM back when other programs need it and takes it back later)\n";
+           "expert cache gives VRAM back when other programs need it and takes it back later); "
+           "--flashnext-tail-skip R (0..9, default off) does not compute an uncached expert that every "
+           "token of a decode step ranks only at 0-based rank R or lower of its ten (7: the 8th-10th "
+           "smallest weights); it contributes zero, which changes the output slightly and saves CPU "
+           "expert work; --flashnext-ngram N (2..16, default off; needs --flashnext-mtp) lets a decode "
+           "step draft what followed the last N tokens where they appeared before in the prompt or the "
+           "output instead of asking the MTP head (exact: drafts are verified)\n";
 }
 
 ServeOptions parse_serve_options(int argc, char** argv) {
@@ -269,6 +275,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--flashnext-park-mib") {
             options.flashnext.park_mib = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--flashnext-park-mib"), "flashnext-park-mib"));
+        } else if (arg == "--flashnext-tail-skip") {
+            const int rank = parse_nonnegative_int(require_value("--flashnext-tail-skip"), "flashnext-tail-skip");
+            if (rank > 9) { throw std::invalid_argument("--flashnext-tail-skip must be 0..9"); }
+            options.flashnext.tail_skip_rank = rank;
+        } else if (arg == "--flashnext-ngram") {
+            const int n = parse_nonnegative_int(require_value("--flashnext-ngram"), "flashnext-ngram");
+            if (n == 1 || n > 16) { throw std::invalid_argument("--flashnext-ngram must be 0 or 2..16"); }
+            options.flashnext.ngram_match_tokens = static_cast<std::uint32_t>(n);
         } else if (arg == "--flashnext-draft") {
             const int drafts =
                 parse_nonnegative_int(require_value("--flashnext-draft"), "flashnext-draft");

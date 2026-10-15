@@ -6,6 +6,7 @@
 #include "flashnext/shards.h"
 #include "flashnext/vision.h"
 #include "models/qwen3_5/frontend/prepared_prompt.h"
+#include "models/qwen3_5/program/speculative/ngram_pool.h"
 #include "runtime/engine/flashnext_frontend.h"
 #include "runtime/engine/generation_budget.h"
 #include "runtime/engine/host_sampler.h"
@@ -15,6 +16,7 @@
 #include <atomic>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -28,6 +30,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <variant>
@@ -169,6 +172,11 @@ struct Snapshot {
     std::vector<float> logits;
     PrefixReusePath path    = PrefixReusePath::PrivateEndpoint;
     std::uint64_t last_used = 0;
+    // Which snapshots go first when the set is full (lowest class, then least recently used):
+    // 2 = where a request's new messages began (the frontier another continuation of that
+    // conversation branches from, e.g. the live turn after a background review that forked off it),
+    // or a conversation's end before parking; 1 = a prompt end; 0 = the other anchors.
+    std::uint8_t evict_class = 0;
 
     [[nodiscard]] std::uint32_t depth() const noexcept {
         return static_cast<std::uint32_t>(state.tokens.size());
@@ -235,6 +243,11 @@ struct FlashNextCore::Request {
     MediaKeys media;
     std::vector<std::shared_ptr<const std::vector<float>>> image_rows;
     SpeculativeStats speculative;
+    // Degenerate-output guards (FlashNextCore::degenerate): the current run of one repeated token, and the reasoning's
+    // length at its last periodic-tail check.
+    std::optional<TokenId> repeat_token;
+    std::uint32_t repeat_run         = 0;
+    std::size_t loop_checked_chars   = 0;
 
     // Consumer channel.
     std::mutex mutex;
@@ -330,6 +343,9 @@ public:
         if (options.flashnext.vram_reserve_mib >= 0) {
             engine_options.vram_reserve_mib = options.flashnext.vram_reserve_mib;
         }
+        if (options.flashnext.tail_skip_rank >= 0) {
+            engine_options.tail_skip_rank = options.flashnext.tail_skip_rank;
+        }
         if (options.flashnext.expert_threads != 0) {
             engine_options.cpu_threads = static_cast<int>(options.flashnext.expert_threads);
         }
@@ -344,6 +360,18 @@ public:
         }
         if (draft_tokens != 0 && !engine->has_mtp()) {
             throw std::invalid_argument("the Flash-Next engine did not load the MTP head");
+        }
+        if (const std::uint32_t n = options.flashnext.ngram_match_tokens; n != 0) {
+            if (draft_tokens == 0) {
+                std::fprintf(stderr, "Flash-Next: n-gram drafts need the MTP head's verify path (--flashnext-mtp); off\n");
+            } else if (engine->n_vocab() > models::qwen3_5::NgramDraftPool::kMaximumTokenDomain) {
+                std::fprintf(stderr, "Flash-Next: the vocabulary is too large for the n-gram pool; n-gram drafts off\n");
+            } else {
+                ngram = std::make_unique<models::qwen3_5::NgramDraftPool>(models::qwen3_5::NgramPoolSpec{
+                    .match_tokens = n, .entries = kNgramEntries, .token_domain = engine->n_vocab()});
+                std::fprintf(stderr, "Flash-Next: n-gram drafts on (match %u tokens, %.0f MiB pool)\n", n,
+                             double(ngram->memory_bytes()) / double(1 << 20));
+            }
         }
         if (vision && engine->image_token_id() >= 0 && engine->image_token_id() != image_pad) {
             throw std::invalid_argument("the model's PLE image token is not the tokenizer's <|image_pad|>");
@@ -642,6 +670,18 @@ private:
 
     void complete_success(Request& request, FinishReason reason) {
         const Clock::time_point now = Clock::now();
+        if (ngram && request.speculative.rounds != 0) {
+            const SpeculativeStats& s = request.speculative;
+            std::fprintf(stderr,
+                         "Flash-Next: request %llu: %zu tokens, %.1f tok/s decode; drafts accepted: MTP %llu/%llu, "
+                         "n-gram %llu/%llu\n",
+                         static_cast<unsigned long long>(request.id), request.generated.size(),
+                         request.decode_seconds > 0.0 ? double(request.generated.size()) / request.decode_seconds : 0.0,
+                         static_cast<unsigned long long>(s.accepted_tokens - s.ngram_accepted_tokens),
+                         static_cast<unsigned long long>(s.drafted_tokens - s.ngram_drafted_tokens),
+                         static_cast<unsigned long long>(s.ngram_accepted_tokens),
+                         static_cast<unsigned long long>(s.ngram_drafted_tokens));
+        }
         GenerationResult result;
         result.prompt                  = request.prompt_summary;
         result.generated_token_ids     = std::move(request.generated);
@@ -989,12 +1029,14 @@ private:
         });
     }
 
-    void capture(std::uint32_t depth, PrefixReusePath path, const std::vector<float>* logits) {
+    void capture(std::uint32_t depth, PrefixReusePath path, const std::vector<float>* logits,
+                 std::uint8_t evict_class = 0) {
         if (snapshot_capacity == 0 || depth != live_tokens) { return; }
         drop_stale_snapshots();
         for (Snapshot& existing : snapshots) {
             if (existing.depth() == depth) { // the engine holds both: same tokens
-                existing.last_used = ++use_clock;
+                existing.last_used   = ++use_clock;
+                existing.evict_class = std::max(existing.evict_class, evict_class);
                 if (path_rank(path) > path_rank(existing.path)) { existing.path = path; }
                 if (logits != nullptr && existing.logits.empty()) {
                     existing.logits.assign(logits->begin(), logits->begin() + public_tokens);
@@ -1004,8 +1046,10 @@ private:
         }
         if (snapshots.size() >= snapshot_capacity) {
             snapshots.erase(std::min_element(
-                snapshots.begin(), snapshots.end(),
-                [](const Snapshot& a, const Snapshot& b) { return a.last_used < b.last_used; }));
+                snapshots.begin(), snapshots.end(), [](const Snapshot& a, const Snapshot& b) {
+                    return a.evict_class != b.evict_class ? a.evict_class < b.evict_class
+                                                          : a.last_used < b.last_used;
+                }));
         }
         const auto started = Clock::now();
         Snapshot snapshot;
@@ -1014,8 +1058,9 @@ private:
                         [](std::uint64_t k) { return k != 0; })) {
             snapshot.media.assign(kv_media.begin(), kv_media.begin() + depth);
         }
-        snapshot.path      = path;
-        snapshot.last_used = ++use_clock;
+        snapshot.path        = path;
+        snapshot.last_used   = ++use_clock;
+        snapshot.evict_class = evict_class;
         if (logits != nullptr) {
             snapshot.logits.assign(logits->begin(), logits->begin() + public_tokens);
         }
@@ -1108,7 +1153,7 @@ private:
         for (Snapshot& snapshot : snapshots) {
             if (snapshot.depth() <= keep) { snapshot.last_used = ++use_clock; }
         }
-        if (live_reusable && live_tokens == end) { capture(end, PrefixReusePath::PrivateEndpoint, nullptr); }
+        if (live_reusable && live_tokens == end) { capture(end, PrefixReusePath::PrivateEndpoint, nullptr, 2); }
         std::vector<std::size_t> deep;
         for (std::size_t i = 0; i < snapshots.size(); ++i) {
             if (snapshots[i].depth() > keep) { deep.push_back(i); }
@@ -1219,7 +1264,48 @@ private:
     // ---------------------------------------------------------------------------------------
     // Request execution
 
+    // After non-finite logits: drop every state that may hold the poison - the live sequence, every snapshot and
+    // every parked conversation - so that the next prompt is read from token 0.
+    void drop_poisoned_state() {
+        parked.clear();
+        parked_bytes = 0;
+        if (!recover()) { throw std::runtime_error("Flash-Next could not reset after non-finite logits"); }
+    }
+
+    // Runs a request; on non-finite logits (NonFiniteLogits) the cached state is dropped, then a request that has
+    // committed nothing yet is read again once from token 0, and a reply that had started ends there ("length").
     void execute(Request& request) {
+        for (int attempt = 0;; ++attempt) {
+            try {
+                execute_once(request);
+                return;
+            } catch (const NonFiniteLogits& error) {
+                const std::size_t dropped_snapshots = snapshots.size(), dropped_parked = parked.size();
+                drop_poisoned_state();
+                const bool started = !request.generated.empty();
+                std::fprintf(stderr,
+                             "Flash-Next: request %llu: non-finite logits in %s; dropped the live sequence, %zu "
+                             "snapshots and %zu parked conversations; %s\n",
+                             static_cast<unsigned long long>(request.id), error.what(), dropped_snapshots, dropped_parked,
+                             started            ? "the reply ends here"
+                             : attempt == 0     ? "reading the prompt again from token 0"
+                                                : "giving up");
+                if (started) {
+                    (void)request.output.preview_terminal(FinishReason::OutputLimit);
+                    append_output(request, request.output.commit_preview());
+                    complete_success(request, FinishReason::OutputLimit);
+                    return;
+                }
+                if (attempt > 0) {
+                    throw RequestError(RequestErrorKind::Unavailable,
+                                       "the model's output was not finite twice; its cached state was dropped");
+                }
+                request.computed_prompt_tokens = 0;
+            }
+        }
+    }
+
+    void execute_once(Request& request) {
         const Clock::time_point admitted = Clock::now();
         request.admitted_at              = admitted;
         engine_ns                        = 0;
@@ -1429,6 +1515,7 @@ private:
         std::vector<float> logits;
         std::uint32_t cursor = base.depth;
         std::size_t next     = 0;
+        bool branch_point    = true;  // the request's first capture: where its new messages begin
         while (cursor < n) {
             check_running();
             if (request.cancelled.load(std::memory_order_acquire)) { return std::nullopt; }
@@ -1445,7 +1532,9 @@ private:
                 if (frontier == cursor && path_rank(kind) >= path_rank(path)) { path = kind; }
             }
             if (path != PrefixReusePath::Root) {
-                capture(cursor, path, cursor == n ? &logits : nullptr);
+                capture(cursor, path, cursor == n ? &logits : nullptr,
+                        branch_point ? 2 : cursor == n ? 1 : 0);
+                branch_point = false;
             }
         }
         return logits;
@@ -1455,6 +1544,76 @@ private:
         FinishReason finish_reason = FinishReason::None;
         bool control               = false; // the thinking budget is spent: force the close next
     };
+
+    // ---- Non-finite logits (after Strata f332a855 / 003ea8c6, #879) ----
+    // Rarely a step's logits become NaN or infinite; the reply then degenerates (token 0 forever) and the poison
+    // stays in the conversation's K/V and recurrent state, so with prefix reuse and parked conversations every later
+    // turn of it would read it again. Every row the decoder samples from is checked first (a bitwise scan of ~250K
+    // values, microseconds against a ~20 ms step); a non-finite row commits none of its step's tokens, and
+    // execute() drops every retained state (drop_poisoned_state) before the request is read again from token 0
+    // (nothing sent yet) or ends ("length").
+    struct NonFiniteLogits : std::runtime_error {
+        using std::runtime_error::runtime_error;
+    };
+
+    static bool finite_logits(std::span<const float> values) noexcept {
+        // on the bits (exponent all ones: Inf or NaN), so that no floating-point mode can fold the test away
+        std::uint32_t non_finite = 0;
+        for (const float value : values) {
+            const auto bits = std::bit_cast<std::uint32_t>(value);
+            non_finite |= static_cast<std::uint32_t>((bits & 0x7f800000U) == 0x7f800000U);
+        }
+        return non_finite == 0;
+    }
+
+    // NINFER_NAN_INJECT=n (debug): the n-th check since the process started reports non-finite logits
+    static bool inject_non_finite() {
+        static const long long target = [] {
+            const char* value = std::getenv("NINFER_NAN_INJECT");
+            return value != nullptr ? std::atoll(value) : 0LL;
+        }();
+        static std::atomic<long long> checks{0};
+        return target > 0 && ++checks == target;
+    }
+
+    static void ensure_finite(std::span<const float> values, std::uint32_t position, const char* where) {
+        if (!finite_logits(values) || inject_non_finite()) {
+            throw NonFiniteLogits(std::string(where) + " at position " + std::to_string(position));
+        }
+    }
+
+    // ---- Degenerate output (after Strata #606 and 253e09f1, #1753) ----
+    // A reply that repeats one token kRepeatStopTokens times in a row (a loop, or a broken state answering one token
+    // forever), or reasoning whose last kLoopTailChars characters repeat a pattern of at most kLoopTailPeriod
+    // characters (a loop written as one long word, e.g. a digit string cycling a short pattern, which never repeats a
+    // token), would otherwise run to the output limit: 32K tokens hold the engine for about 11 minutes. Either ends
+    // the reply there ("length").
+    static constexpr std::uint32_t kRepeatStopTokens  = 256;
+    static constexpr std::size_t kLoopTailChars       = 2048;
+    static constexpr std::size_t kLoopTailPeriod      = 64;
+    static constexpr std::size_t kLoopCheckEveryChars = 256;
+
+    static const char* degenerate(Request& request, TokenId token) {
+        if (request.repeat_token && *request.repeat_token == token) {
+            ++request.repeat_run;
+        } else {
+            request.repeat_token = token;
+            request.repeat_run   = 1;
+        }
+        if (request.repeat_run >= kRepeatStopTokens) { return "one token repeated 256 times in a row"; }
+        const std::string& reasoning = request.reasoning;
+        if (reasoning.size() >= kLoopTailChars &&
+            reasoning.size() >= request.loop_checked_chars + kLoopCheckEveryChars) {
+            request.loop_checked_chars = reasoning.size();
+            const std::string_view tail(reasoning.data() + reasoning.size() - kLoopTailChars, kLoopTailChars);
+            for (std::size_t period = 1; period <= kLoopTailPeriod; ++period) {
+                if (tail.substr(period) == tail.substr(0, kLoopTailChars - period)) {
+                    return "reasoning repeating a short pattern";
+                }
+            }
+        }
+        return nullptr;
+    }
 
     // Commits one model token through the output policy.
     Committed commit_model_token(Request& request, GenerationBudget& budget, HostSampler& sampler,
@@ -1468,6 +1627,15 @@ private:
         sampler.commit(token);
         budget.commit(1);
         append_output(request, request.output.commit_preview(), record_committed_output(request));
+        if (decision.finish_reason == FinishReason::None) {
+            if (const char* why = degenerate(request, token)) {
+                std::fprintf(stderr, "Flash-Next: request %llu stopped after %zu output tokens: %s\n",
+                             static_cast<unsigned long long>(request.id), request.generated.size(), why);
+                (void)request.output.preview_terminal(FinishReason::OutputLimit);
+                append_output(request, request.output.commit_preview());
+                return Committed{.finish_reason = FinishReason::OutputLimit};
+            }
+        }
         return Committed{
             .finish_reason = decision.finish_reason,
             .control       = decision.continuation == ContinuationAction::ApplyTargetControl,
@@ -1532,10 +1700,26 @@ private:
             request.speculative.verify_window = draft_tokens + 1;
             request.speculative.accepted_per_position.assign(draft_tokens, 0);
         }
+        if (ngram) {
+            // The ledger is the prompt and the output so far; the whole prompt is recorded again so that
+            // this conversation's n-grams are the most recent ones in the pool.
+            const std::vector<TokenId>& prompt_ids =
+                models::qwen3_5::PreparedPromptAccess::view(request.prompt).token_ids;
+            ngram_ledger.assign(prompt_ids.begin(), prompt_ids.end());
+            ngram_ledger.insert(ngram_ledger.end(), request.generated.begin(), request.generated.end());
+            ngram_prompt_tokens = prompt_ids.size();
+            ngram_shadow_count  = 0;
+            try {
+                ngram->observe(ngram_ledger, 0);
+            } catch (const std::invalid_argument& error) {
+                std::fprintf(stderr, "Flash-Next: the prompt was not recorded for n-gram drafts: %s\n", error.what());
+            }
+        }
         const auto vocabulary          = static_cast<std::size_t>(engine->n_vocab());
         std::int32_t position          = static_cast<std::int32_t>(prompt_tokens);
         HostSampler::Purpose purpose   = HostSampler::Purpose::Prefill;
         Clock::time_point step_started = Clock::now();
+        ensure_finite(logits, prompt_tokens, "the prompt's last row");
         // A committed token the engine has not executed yet; otherwise `logits` is current.
         std::optional<TokenId> unexecuted;
         const auto execute_control = [&](TokenId token) {
@@ -1550,6 +1734,7 @@ private:
             logits       = forward(step);
             position     = static_cast<std::int32_t>(live_tokens) - 1;
             purpose      = HostSampler::Purpose::Decode;
+            ensure_finite(logits, live_tokens, "a decode step");
         };
         for (;;) {
             check_running();
@@ -1584,17 +1769,29 @@ private:
                 request.output.model_token_budget_remaining(budget.remaining());
             std::uint32_t k =
                 model_budget == 0 ? 0 : std::min(choose_drafts(), model_budget - 1);
-            if (k == 0) {
+            // N-gram drafts replace the MTP head's when they promise more tokens per second.
+            std::uint32_t ngram_k = 0;
+            if (ngram && model_budget > 1) {
+                ngram_k = propose_ngrams(request, k, std::min({kMaxDrafts, draft_tokens, model_budget - 1}));
+            }
+            if (k == 0 && ngram_k == 0) {
                 logits   = forward(std::span<const TokenId>(&token, 1));
                 position = static_cast<std::int32_t>(live_tokens) - 1;
                 purpose  = HostSampler::Purpose::Decode;
+                ensure_finite(logits, live_tokens, "a decode step");
                 if (draft_tokens != 0) observe_step(0, Clock::now() - step_started);
                 continue;
             }
 
-            const std::uint32_t base          = live_tokens;
-            std::vector<std::int32_t> drafted = engine->draft(token, static_cast<int>(k));
-            if (drafted.size() > k) { throw std::logic_error("MTP head drafted a wrong count"); }
+            const std::uint32_t base = live_tokens;
+            std::vector<std::int32_t> drafted;
+            if (ngram_k != 0) {
+                k = ngram_k;
+                drafted.assign(ngram_shadow.begin(), ngram_shadow.begin() + k);
+            } else {
+                drafted = engine->draft(token, static_cast<int>(k));
+                if (drafted.size() > k) { throw std::logic_error("MTP head drafted a wrong count"); }
+            }
             // The engine stops drafting at an invalid draft (its output went non-finite); the step then
             // verifies the drafts it has, or feeds the token alone.
             if (drafted.size() < k) {
@@ -1603,6 +1800,7 @@ private:
                     logits   = forward(std::span<const TokenId>(&token, 1));
                     position = static_cast<std::int32_t>(live_tokens) - 1;
                     purpose  = HostSampler::Purpose::Decode;
+                    ensure_finite(logits, live_tokens, "a decode step");
                     observe_step(0, Clock::now() - step_started);
                     continue;
                 }
@@ -1613,6 +1811,7 @@ private:
             if (rows.size() != step.size() * vocabulary) {
                 throw std::logic_error("Flash-Next verification returned a wrong logit count");
             }
+            ensure_finite(rows, base, "a verify window");  // none of the window's tokens is committed then
             std::uint32_t kept = 0;
             TokenId last       = token;
             Committed outcome;
@@ -1621,7 +1820,7 @@ private:
                     std::span<const float>(rows).subspan(row * vocabulary, vocabulary),
                     static_cast<std::int32_t>(base + row), HostSampler::Purpose::Decode);
                 outcome = commit_model_token(request, budget, sampler, last);
-                if (row < k) observe_draft(row, last == drafted[row]);
+                if (row < k && ngram_k == 0) observe_draft(row, last == drafted[row]);
                 if (row < k && last == drafted[row] &&
                     outcome.finish_reason == FinishReason::None && !outcome.control) {
                     ++request.speculative.accepted_per_position[row];
@@ -1630,7 +1829,13 @@ private:
                 }
                 break;
             }
-            observe_step(k, Clock::now() - step_started);
+            if (ngram_k != 0) {
+                observe_ngram_step(k, Clock::now() - step_started);
+                request.speculative.ngram_drafted_tokens += k;
+                request.speculative.ngram_accepted_tokens += kept;
+            } else {
+                observe_step(k, Clock::now() - step_started);
+            }
             // Keep the fed token and the accepted drafts; `last` is committed but not executed.
             if (kept < k) { engine->rollback(static_cast<int>(1 + kept)); }
             live_tokens = base + 1 + kept;
@@ -1691,6 +1896,78 @@ private:
     void observe_step(std::uint32_t k, Clock::duration elapsed) {
         const double ms = std::chrono::duration<double, std::milli>(elapsed).count();
         double & e      = step_ms_ema[std::min(k, kMaxDrafts)];
+        e               = e > 0.0 ? e + kAlpha * (ms - e) : ms;
+    }
+
+    // Expected tokens per millisecond of an MTP step with k drafts.
+    [[nodiscard]] double mtp_rate(std::uint32_t k) const {
+        const double t0 = step_ms_ema[0] > 0.0 ? step_ms_ema[0] : 20.0;
+        double expected = 1.0, reach = 1.0;
+        for (std::uint32_t i = 0; i < k; ++i) {
+            reach *= accept_ema[i];
+            expected += reach;
+        }
+        return expected / (step_ms_ema[k] > 0.0 ? step_ms_ema[k] : t0 * (1.0 + 0.5 * k));
+    }
+
+    // N-gram drafts. The pool maps every n-token window of the prompt and the output to the token that
+    // followed it last; walking it from the last n committed tokens drafts a copy of what followed them
+    // before. Each step's proposal is scored against the tokens that were then committed, whether or
+    // not the step verified it, so the acceptance estimates follow the text (a copy starts and ends
+    // abruptly) at no cost; a step uses the proposal when it promises more tokens per millisecond than
+    // the MTP head's drafts. The step times of n-gram steps are their own: they skip the MTP passes.
+    static constexpr std::size_t kNgramEntries = std::size_t(1) << 22;  // 16 MiB
+    static constexpr double kNgramAlpha        = 0.1;
+    std::unique_ptr<models::qwen3_5::NgramDraftPool> ngram;
+    std::vector<TokenId> ngram_ledger;  // the prompt and the committed output of the decoding request
+    std::size_t ngram_prompt_tokens = 0;
+    std::array<TokenId, kMaxDrafts> ngram_shadow{};  // the last proposal, for ledger positions from ngram_shadow_at
+    std::uint32_t ngram_shadow_count = 0;
+    std::size_t ngram_shadow_at      = 0;
+    std::array<double, kMaxDrafts> ngram_accept_ema{0.5, 0.5, 0.5};
+    std::array<double, kMaxDrafts + 1> ngram_step_ms_ema{0.0, 0.0, 0.0, 0.0};  // 0 = not measured yet
+
+    // Brings the ledger up to the committed output, records it in the pool, scores the last proposal,
+    // proposes up to `room` drafts into ngram_shadow, and returns how many of them the step should
+    // verify instead of the MTP head's `mtp_k` (0: use the MTP head).
+    std::uint32_t propose_ngrams(const Request& request, std::uint32_t mtp_k, std::uint32_t room) {
+        const std::size_t seen = ngram_ledger.size();
+        const std::size_t done = ngram_prompt_tokens + request.generated.size();
+        if (done > seen) {
+            ngram_ledger.insert(ngram_ledger.end(),
+                                request.generated.begin() + std::ptrdiff_t(seen - ngram_prompt_tokens),
+                                request.generated.end());
+            ngram->observe(ngram_ledger, seen);
+        }
+        for (std::uint32_t i = 0; i < ngram_shadow_count && ngram_shadow_at + i < ngram_ledger.size(); ++i) {
+            const bool hit = ngram_ledger[ngram_shadow_at + i] == ngram_shadow[i];
+            ngram_accept_ema[i] += kNgramAlpha * ((hit ? 1.0 : 0.0) - ngram_accept_ema[i]);
+            if (!hit) break;
+        }
+        ngram_shadow_at    = ngram_ledger.size();
+        ngram_shadow_count = static_cast<std::uint32_t>(
+            ngram->propose(ngram_ledger, std::span<TokenId>(ngram_shadow.data(), std::min(room, kMaxDrafts))));
+        const double t0  = step_ms_ema[0] > 0.0 ? step_ms_ema[0] : 20.0;
+        double expected  = 1.0, reach = 1.0, best_rate = mtp_rate(mtp_k);
+        std::uint32_t best = 0;
+        for (std::uint32_t j = 1; j <= ngram_shadow_count; ++j) {
+            reach *= ngram_accept_ema[j - 1];
+            expected += reach;
+            // until measured, an n-gram step is taken to cost what an MTP step of its width does
+            const double t = ngram_step_ms_ema[j] > 0.0 ? ngram_step_ms_ema[j]
+                             : step_ms_ema[j] > 0.0     ? step_ms_ema[j]
+                                                        : t0 * (1.0 + 0.5 * j);
+            if (expected / t > best_rate) {
+                best_rate = expected / t;
+                best      = j;
+            }
+        }
+        return best;
+    }
+
+    void observe_ngram_step(std::uint32_t k, Clock::duration elapsed) {
+        const double ms = std::chrono::duration<double, std::milli>(elapsed).count();
+        double & e      = ngram_step_ms_ema[std::min(k, kMaxDrafts)];
         e               = e > 0.0 ? e + kAlpha * (ms - e) : ms;
     }
 

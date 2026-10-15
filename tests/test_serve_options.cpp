@@ -187,14 +187,22 @@ int main() {
         parse({"ninfer-serve", "model.gguf", "--flashnext-expert-cache-mib", "4096",
                "--flashnext-expert-threads", "12", "--flashnext-routing-stats", "routing.bin",
                "--flashnext-host-expert-images", "--flashnext-mtp", "mtp.gguf", "--flashnext-draft",
-               "3", "--flashnext-park-mib", "4096", "--flashnext-vram-reserve-mib", "2048"});
+               "3", "--flashnext-park-mib", "4096", "--flashnext-vram-reserve-mib", "2048",
+               "--flashnext-tail-skip", "7", "--flashnext-ngram", "4"});
     failures += check(
         flashnext.flashnext.expert_cache_mib == 4096 && flashnext.flashnext.expert_threads == 12 &&
             flashnext.flashnext.routing_stats == "routing.bin" &&
             flashnext.flashnext.host_expert_images && flashnext.flashnext.mtp_path == "mtp.gguf" &&
             flashnext.flashnext.draft_tokens == 3 && flashnext.flashnext.park_mib == 4096 &&
-            flashnext.flashnext.vram_reserve_mib == 2048,
+            flashnext.flashnext.vram_reserve_mib == 2048 && flashnext.flashnext.tail_skip_rank == 7 &&
+            flashnext.flashnext.ngram_match_tokens == 4,
         "Flash-Next options were not applied");
+    failures += check(defaults.flashnext.tail_skip_rank < 0, "the Flash-Next tail skip is not off by default");
+    bool wide_tail_rejected = false;
+    try {
+        (void)parse({"ninfer-serve", "model.gguf", "--flashnext-tail-skip", "10"});
+    } catch (const std::invalid_argument&) { wide_tail_rejected = true; }
+    failures += check(wide_tail_rejected, "a Flash-Next tail skip rank of 10 was accepted");
     bool wide_draft_rejected = false;
     try {
         (void)parse({"ninfer-serve", "model.gguf", "--flashnext-mtp", "mtp.gguf",

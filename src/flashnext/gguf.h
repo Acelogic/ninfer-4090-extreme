@@ -37,6 +37,8 @@ struct GgufTensor {
     std::vector<std::int64_t> shape;  // ne[0] is the contiguous (row) dimension, as in ggml
     const std::uint8_t * data = nullptr;
     std::size_t bytes = 0;
+    int file = -1;                  // the shard holding the bytes (GgufModel::file_path), for reads that bypass the mapping
+    std::uint64_t file_offset = 0;  // where they start in that file
     std::int64_t elements() const;
 };
 
@@ -65,6 +67,7 @@ public:
     const GgufTensor * find(const std::string & name) const;
     const GgufTensor & tensor(const std::string & name) const;  // throws when missing
     const std::map<std::string, GgufTensor> & tensors() const { return tensors_; }
+    const std::string & file_path(int file) const;  // the path of shard `file` (GgufTensor::file)
 
 private:
     std::vector<std::unique_ptr<MappedFile>> files_;

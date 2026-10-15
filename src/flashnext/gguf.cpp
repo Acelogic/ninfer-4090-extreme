@@ -272,12 +272,19 @@ GgufModel::GgufModel(const std::vector<std::string> & paths) {
             if (pt.offset > data_size || bytes > data_size - pt.offset) throw std::runtime_error(pt.t.name + " extends past the end of " + path);
             pt.t.bytes = std::size_t(bytes);
             pt.t.data = f.data() + data_start + pt.offset;
+            pt.t.file = int(files_.size()) - 1;
+            pt.t.file_offset = data_start + pt.offset;
             tensors_.emplace(pt.t.name, std::move(pt.t));
         }
     }
 }
 
 GgufModel::~GgufModel() = default;
+
+const std::string & GgufModel::file_path(int file) const {
+    if (file < 0 || std::size_t(file) >= files_.size()) throw std::runtime_error("GGUF: no shard " + std::to_string(file));
+    return files_[std::size_t(file)]->path();
+}
 
 namespace {
 const GgufValue & lookup(const std::map<std::string, GgufValue> & kv, const std::string & key) {

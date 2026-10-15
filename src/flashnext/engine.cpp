@@ -990,6 +990,15 @@ struct Engine::Impl {
             stats.cached_experts += std::int64_t(list.size());
         }
         stats.cache_gib = double(used) / double(1 << 30);
+        // tail skip: only while the cache holds less than tail_skip_max_cached of all routed experts (decided once,
+        // before the decode graphs are captured with it)
+        const double cached_share = double(stats.cached_experts) / double(std::int64_t(cfg.n_layer) * fc::kExperts);
+        const bool tail_ok = opt.tail_skip_rank > 0 && opt.tail_skip_rank < fc::kUsed;
+        tail_rank = tail_ok && cached_share < opt.tail_skip_max_cached ? opt.tail_skip_rank : 0;
+        stats.tail_skip_rank = tail_rank;
+        if (tail_ok)
+            std::fprintf(stderr, "engine: tail skip %s (uncached experts every token ranks %d-%d are not computed; %.0f%% of experts cached)\n",
+                         tail_rank ? "on" : "off", opt.tail_skip_rank + 1, fc::kUsed, 100.0 * cached_share);
     }
     ~Impl() {
         warm_stop = true;
@@ -1695,7 +1704,7 @@ struct Engine::Impl {
         LayerCache & C = cache[std::size_t(il)];
         const bool zc = !images.empty() && opt.gpu_miss_permille > 0;
         fc::moe_plan(ids.as<std::int32_t>(), C.dmap.as<std::int32_t>(), slots.as<std::int32_t>(), host_slots.as<std::int32_t>(),
-                     plan_oncpu.as<std::uint8_t>(), T, zc ? opt.gpu_miss_permille : 0, stream);
+                     plan_oncpu.as<std::uint8_t>(), T, zc ? opt.gpu_miss_permille : 0, tail_rank, stream);
         fc::link_signal(ids.as<std::int32_t>(), wts.as<float>(), plan_oncpu.as<std::uint8_t>(), mixed.as<float>(), T, link_d + il, dseq, stream);
         if (zc) {
             // misses read from host memory run beside the cached experts: PCIe and VRAM bandwidth add up
@@ -1734,14 +1743,15 @@ struct Engine::Impl {
                 std::atomic_thread_fence(std::memory_order_acquire);
                 stats.gpu_wait_ms += std::chrono::duration<double, std::milli>(clk::now() - w0).count();
                 const LayerCache & C = cache[std::size_t(il)];
-                std::size_t on_cpu = 0, hits = 0, reads = 0;
+                std::size_t on_cpu = 0, hits = 0, reads = 0, skipped = 0;
                 for (std::size_t i = 0; i < ke; ++i) {
                     const std::int32_t e = Lk.ids[i];
                     if (e < 0 || e >= fc::kExperts) throw std::runtime_error("engine: router returned an invalid expert");
                     observe(il, e);
-                    // the GPU's plan decides which misses it reads from host memory itself
-                    h_oncpu->get()[i] = Lk.on_cpu[i] != 0;
+                    // the GPU's plan decides which misses it reads from host memory itself, and which it skips (2)
+                    h_oncpu->get()[i] = Lk.on_cpu[i] == 1;
                     on_cpu += h_oncpu->get()[i];
+                    skipped += Lk.on_cpu[i] == 2;
                     hits += C.map[std::size_t(e)] >= 0;
                     if (h_oncpu->get()[i]) {  // a distinct expert of the CPU's share (its weights are read once)
                         bool seen = false;
@@ -1754,7 +1764,8 @@ struct Engine::Impl {
                 route_dump(il, n_past, T, Lk.ids);
                 stats.expert_pairs += std::int64_t(ke);
                 stats.expert_hits += std::int64_t(hits);
-                stats.expert_host_reads += std::int64_t(ke - hits - on_cpu);
+                stats.expert_host_reads += std::int64_t(ke - hits - on_cpu - skipped);
+                stats.expert_tail_skipped += std::int64_t(skipped);
                 if (on_cpu) {
                     const auto c0 = clk::now();
                     experts->run(il, T, Lk.x, Lk.ids, Lk.weights, h_oncpu->get(), Lk.out);
@@ -2347,6 +2358,7 @@ struct Engine::Impl {
         int every = 1, max_swaps = 192;
     } ap;
     bool adapt_on = false;  // set by setup_adaptation()
+    int tail_rank = 0;      // the tail skip in effect (EngineOptions::tail_skip_rank), set by fill_cache()
     // With decode adaptation a prompt's routing only refills the slots it borrowed: re-ranking the whole cache from it
     // after a 32K-token prompt took 0.4 s and gained less over 256 tokens than the adaptation does in a few steps
     // (32K prompt, decode: 54.0 against 49.7 tok/s; with MTP 56.8 against 57.0). NINFER_FN_RERANK=1: re-rank anyway.

@@ -66,6 +66,13 @@ struct EngineOptions {
     // Re-rank the expert cache after every decode step from the last steps' routing, swapping experts in the background
     // (needs the pinned CPU copy, i.e. prefill_lend and prefill_stream). Off: only after prompts and every 256 tokens.
     bool decode_adapt = true;
+    // Tail skip (decode and verify steps; changes the output slightly): a selected expert that is not in the VRAM cache
+    // and that every token of the step ranks only at tail_skip_rank or lower (0-based, of its top-10; 7 = the 8th to 10th
+    // smallest weights) is not computed at all: it contributes zero and the others keep their router weights. Less CPU
+    // expert work per step. 0 = off. It stays off while tail_skip_max_cached or more of all routed experts are cached
+    // in VRAM (then misses are few and cheap). After Strata's STRATA_ROUTE_TAIL_SKIP (65268d99, b4e3407b, 6ab541f6).
+    int tail_skip_rank = 0;
+    double tail_skip_max_cached = 0.9;
     // KV streaming (kv_cache.h): the attention layers' K/V live in pinned host memory and VRAM keeps a page
     // cache of kv_resident cells per layer, so a long window costs little VRAM. -1: on when max_ctx exceeds
     // kv_resident; 0: off (all of it in VRAM); 1: on.
@@ -97,6 +104,8 @@ struct EngineStats {
     std::int64_t cpu_expert_reads = 0;               // decode steps: distinct experts the CPU computed (summed over layers)
     std::int64_t graph_steps[5] = {};                // decode steps by token count (1..4)
     std::int64_t expert_host_reads = 0;              // misses the GPU computed from pinned host memory
+    std::int64_t expert_tail_skipped = 0;            // decode steps: misses not computed at all (tail skip)
+    int tail_skip_rank = 0;                          // the tail skip in effect (0 = off)
     std::int64_t cached_experts = 0;
     double cache_gib = 0;
     std::int64_t cache_swaps = 0;  // experts replaced in VRAM as the routing of recent tokens changed

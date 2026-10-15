@@ -9,12 +9,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <type_traits>
+#include <vector>
 
 #include <immintrin.h>
 
@@ -524,6 +529,200 @@ void gu_q8p(const BlockQ8_0 * g, const BlockQ8_0 * u, const XAct16 * const * xs,
     for (int t = 0; t < NT; ++t) { og[t] = _mm512_reduce_add_ps(ag[t]); ou[t] = _mm512_reduce_add_ps(au[t]); }
 }
 
+// ---- Direct (unbuffered) expert reads at load (after Strata f04ab568 / 52a2dd10) ----
+// The routed experts (~60 GB) used to be copied out of the mapped GGUF page fault by page fault: on a cold start that
+// ran at 0.3-0.5 GB/s (minutes) and pushed the PLE table out of the page cache. When the experts are not in the page
+// cache, each layer's three expert tensors are read instead with FILE_FLAG_NO_BUFFERING (no page cache, 32 MiB
+// requests; 1.6-1.8 GB/s measured on the PC's NVMe while the GGUF stays mapped, which serializes such reads) into a
+// staging buffer, the next layer's reads overlapping this layer's repack. When they are cached (a restart soon after
+// the last), the mapped copy is faster and is kept. NINFER_DIRECT_LOAD=0 forces the mapped copy, =1 the direct reads.
+#if defined(_WIN32)
+class DirectLoad {
+public:
+    DirectLoad(const GgufModel & model, const std::vector<int> & layers) : model_(model) {
+        const char * env = std::getenv("NINFER_DIRECT_LOAD");
+        const std::string mode = env != nullptr ? env : "auto";
+        if (mode == "0") {
+            why_ = "NINFER_DIRECT_LOAD=0";
+            return;
+        }
+        for (const int il : layers) {
+            const std::string p = "blk." + std::to_string(il) + ".";
+            Staged l;
+            l.t[0] = model.find(p + "ffn_gate_exps.weight");
+            l.t[1] = model.find(p + "ffn_up_exps.weight");
+            l.t[2] = model.find(p + "ffn_down_exps.weight");
+            std::size_t need = 0;
+            for (const GgufTensor * t : l.t) {
+                if (t == nullptr || t->file < 0) return;  // load_layer reports the missing tensor
+                need += std::size_t(align_up(t->file_offset + t->bytes) - align_down(t->file_offset));
+            }
+            max_bytes_ = std::max(max_bytes_, need);
+            layers_.push_back(l);
+        }
+        if (layers_.empty()) return;
+        if (mode != "1" && cached()) {
+            why_ = "they are in the page cache";
+            return;
+        }
+        try {
+            for (const Staged & l : layers_)
+                for (const GgufTensor * t : l.t) handle(t->file);
+            for (std::uint8_t *& b : buf_) {
+                b = static_cast<std::uint8_t *>(VirtualAlloc(nullptr, max_bytes_, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+                if (b == nullptr) throw std::runtime_error("no memory for the staging buffers");
+            }
+        } catch (const std::exception & e) {
+            why_ = std::string("direct reads unavailable: ") + e.what();
+            return;
+        }
+        on_ = true;
+        started_ = std::chrono::steady_clock::now();
+        start(0);
+    }
+
+    ~DirectLoad() {
+        if (reader_.joinable()) reader_.join();
+        for (std::uint8_t * b : buf_)
+            if (b != nullptr) VirtualFree(b, 0, MEM_RELEASE);
+        for (auto & [file, h] : handles_) CloseHandle(h);
+    }
+
+    // The staged bytes of the k-th layer's gate, up and down tensors (waits for its reads, then starts the next
+    // layer's into the other buffer); false: copy that layer through the mapping.
+    bool take(std::size_t k, const std::uint8_t * staged[3]) {
+        if (!on_ || k >= layers_.size()) return false;
+        reader_.join();
+        if (!read_ok_) {
+            on_ = false;
+            std::fprintf(stderr, "engine: direct expert reads failed (%s); copying the rest through the mapping\n", error_.c_str());
+            return false;
+        }
+        for (int j = 0; j < 3; ++j) staged[j] = ptr_[k % 2][j];
+        if (k + 1 < layers_.size()) start(k + 1);  // the other buffer's layer was repacked before this call
+        ++used_;
+        return true;
+    }
+
+    void report() const {
+        if (used_ > 0) {
+            const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - started_).count();
+            std::fprintf(stderr, "engine: read %.1f GB of routed experts directly from disk for %zu layers in %.1f s (%.2f GB/s with the repack)\n",
+                         double(bytes_read_) / 1e9, used_, s, double(bytes_read_) / 1e9 / s);
+        } else if (!why_.empty()) {
+            std::fprintf(stderr, "engine: routed experts copied through the mapping (%s)\n", why_.c_str());
+        }
+    }
+
+private:
+    static constexpr std::uint64_t kAlign = 4096;            // sector multiple for FILE_FLAG_NO_BUFFERING
+    static constexpr std::uint64_t kChunk = 32ull << 20;      // bytes per read request
+    static std::uint64_t align_down(std::uint64_t v) { return v & ~(kAlign - 1); }
+    static std::uint64_t align_up(std::uint64_t v) { return (v + kAlign - 1) & ~(kAlign - 1); }
+
+    struct Staged {
+        const GgufTensor * t[3] = {};
+    };
+
+    // Whether the experts are in the page cache: touch 64 pages at random places in them through the mapping (a cached
+    // page faults in a few microseconds, a read from disk takes ~100) and call it cached when at least 90% are fast;
+    // a partly cached set still loads faster with direct reads. The places differ per run: fixed ones would find the
+    // pages the previous run's probe itself brought in.
+    bool cached() const {
+        LARGE_INTEGER freq, seed;
+        QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&seed);
+        std::uint64_t x = std::uint64_t(seed.QuadPart) | 1;
+        const std::size_t n = 64;
+        std::size_t fast = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17;  // xorshift64
+            const Staged & l = layers_[std::size_t(x % layers_.size())];
+            const GgufTensor & t = *l.t[std::size_t((x >> 20) % 3)];
+            const std::uint64_t pages = std::max<std::uint64_t>(1, t.bytes / kAlign);
+            const std::uint64_t off = ((x >> 24) % pages) * kAlign;
+            LARGE_INTEGER a, b;
+            QueryPerformanceCounter(&a);
+            const volatile std::uint8_t sink = t.data[off];
+            (void) sink;
+            QueryPerformanceCounter(&b);
+            fast += 1e6 * double(b.QuadPart - a.QuadPart) / double(freq.QuadPart) < 20.0;
+        }
+        return fast * 10 >= n * 9;
+    }
+
+    HANDLE handle(int file) {
+        const auto it = handles_.find(file);
+        if (it != handles_.end()) return it->second;
+        const std::string & path = model_.file_path(file);
+        const int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+        std::wstring wpath(std::size_t(wlen), L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, wpath.data(), wlen);
+        const HANDLE h = CreateFileW(wpath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                     FILE_FLAG_NO_BUFFERING | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+        if (h == INVALID_HANDLE_VALUE) throw std::runtime_error("cannot open " + path + " unbuffered (" + std::to_string(GetLastError()) + ")");
+        handles_.emplace(file, h);
+        return h;
+    }
+
+    void start(std::size_t k) {
+        read_ok_ = false;
+        reader_ = std::thread([this, k] {
+            try {
+                read_layer(k);
+                read_ok_ = true;
+            } catch (const std::exception & e) {
+                error_ = e.what();
+            }
+        });
+    }
+
+    void read_layer(std::size_t k) {
+        std::uint8_t * dst = buf_[k % 2];
+        for (int j = 0; j < 3; ++j) {
+            const GgufTensor & t = *layers_[k].t[j];
+            const std::uint64_t a = align_down(t.file_offset), e = align_up(t.file_offset + t.bytes);
+            const HANDLE h = handles_.at(t.file);
+            for (std::uint64_t off = a; off < e;) {
+                const DWORD want = DWORD(std::min<std::uint64_t>(kChunk, e - off));
+                LARGE_INTEGER pos;
+                pos.QuadPart = LONGLONG(off);
+                if (!SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) throw std::runtime_error("seek failed (" + std::to_string(GetLastError()) + ")");
+                DWORD got = 0;
+                if (!ReadFile(h, dst + (off - a), want, &got, nullptr)) throw std::runtime_error("read failed (" + std::to_string(GetLastError()) + ")");
+                if (got == 0) break;  // the aligned end passed the end of the file
+                off += got;
+            }
+            ptr_[k % 2][j] = dst + (t.file_offset - a);
+            dst += e - a;
+            bytes_read_ += t.bytes;
+        }
+    }
+
+    const GgufModel & model_;
+    std::vector<Staged> layers_;
+    std::size_t max_bytes_ = 0;
+    std::map<int, HANDLE> handles_;
+    std::uint8_t * buf_[2] = {};
+    const std::uint8_t * ptr_[2][3] = {};
+    std::thread reader_;
+    bool read_ok_ = false;
+    std::string error_;
+    bool on_ = false;
+    std::string why_;
+    std::size_t used_ = 0;
+    std::uint64_t bytes_read_ = 0;
+    std::chrono::steady_clock::time_point started_;
+};
+#else
+class DirectLoad {
+public:
+    DirectLoad(const GgufModel &, const std::vector<int> &) {}
+    bool take(std::size_t, const std::uint8_t *[3]) { return false; }
+    void report() const {}
+};
+#endif
+
 }  // namespace
 
 CpuExperts::CpuExperts(const GgufModel & model, const CpuExpertsConfig & config)
@@ -544,7 +743,12 @@ CpuExperts::CpuExperts(const GgufModel & model, const CpuExpertsConfig & config)
     if (want.empty())
         for (int i = 0; i < n_layer; ++i) want.push_back(i);
     layers_.resize(std::size_t(n_layer));
-    for (int il : want) load_layer(model, il);
+    DirectLoad direct(model, want);
+    for (std::size_t k = 0; k < want.size(); ++k) {
+        const std::uint8_t * staged[3] = {};
+        load_layer(model, want[k], direct.take(k, staged) ? staged : nullptr);
+    }
+    direct.report();
 }
 
 void CpuExperts::add_layer(const GgufModel & model, int il) {
@@ -554,7 +758,7 @@ void CpuExperts::add_layer(const GgufModel & model, int il) {
     load_layer(model, il);
 }
 
-void CpuExperts::load_layer(const GgufModel & model, int il) {
+void CpuExperts::load_layer(const GgufModel & model, int il, const std::uint8_t * const * staged) {
     {
         const std::string p = "blk." + std::to_string(il) + ".";
         const GgufTensor & tg = model.tensor(p + "ffn_gate_exps.weight");
@@ -567,6 +771,10 @@ void CpuExperts::load_layer(const GgufModel & model, int il) {
         if (tg.bytes != row_bytes(tg.type, kEmbd) * kFF * kExperts || tu.bytes != tg.bytes ||
             td.bytes != row_bytes(td.type, kFF) * std::size_t(kEmbd) * kExperts)
             throw std::runtime_error("unexpected expert tensor sizes in layer " + std::to_string(il));
+        // the staged copies (direct reads) when given, else the mapped file
+        const std::uint8_t * const gsrc = staged ? staged[0] : tg.data;
+        const std::uint8_t * const usrc = staged ? staged[1] : tu.data;
+        const std::uint8_t * const dsrc = staged ? staged[2] : td.data;
         auto L = std::make_unique<Layer>();
         if (tg.type == GgufType::IQ3_S && tu.type == GgufType::IQ3_S) {
             L->gu = GateUp::Q4L;
@@ -601,30 +809,30 @@ void CpuExperts::load_layer(const GgufModel & model, int il) {
         pool_.run([&](int t) {
             for (int e = t; e < kExperts; e += nt) {
                 if (Lp->gu == GateUp::Q8_0) {
-                    std::memcpy(Lp->gate + e * Lp->stride, tg.data + e * Lp->gu_expert_bytes, Lp->gu_expert_bytes);
-                    std::memcpy(Lp->up + e * Lp->stride, tu.data + e * Lp->gu_expert_bytes, Lp->gu_expert_bytes);
+                    std::memcpy(Lp->gate + e * Lp->stride, gsrc + e * Lp->gu_expert_bytes, Lp->gu_expert_bytes);
+                    std::memcpy(Lp->up + e * Lp->stride, usrc + e * Lp->gu_expert_bytes, Lp->gu_expert_bytes);
                 } else if (Lp->gu == GateUp::Q4L) {
                     const std::size_t src_bytes = std::size_t(kFF) * 10 * sizeof(BlockIQ3_S);
-                    repack_iq3s_to_q4l(reinterpret_cast<const BlockIQ3_S *>(tg.data + e * src_bytes),
+                    repack_iq3s_to_q4l(reinterpret_cast<const BlockIQ3_S *>(gsrc + e * src_bytes),
                                        reinterpret_cast<BlockQ4L *>(Lp->gate + e * Lp->stride), kFF * 10);
-                    repack_iq3s_to_q4l(reinterpret_cast<const BlockIQ3_S *>(tu.data + e * src_bytes),
+                    repack_iq3s_to_q4l(reinterpret_cast<const BlockIQ3_S *>(usrc + e * src_bytes),
                                        reinterpret_cast<BlockQ4L *>(Lp->up + e * Lp->stride), kFF * 10);
                 } else {
                     const std::size_t src_bytes = std::size_t(kFF) * 10 * sizeof(BlockIQ4_XS);
                     for (int i = 0; i < kFF * 10; ++i) {
-                        repack_iq4xs_block(reinterpret_cast<const BlockIQ4_XS *>(tg.data + e * src_bytes)[i],
+                        repack_iq4xs_block(reinterpret_cast<const BlockIQ4_XS *>(gsrc + e * src_bytes)[i],
                                            reinterpret_cast<BlockQ4X *>(Lp->gate + e * Lp->stride)[i]);
-                        repack_iq4xs_block(reinterpret_cast<const BlockIQ4_XS *>(tu.data + e * src_bytes)[i],
+                        repack_iq4xs_block(reinterpret_cast<const BlockIQ4_XS *>(usrc + e * src_bytes)[i],
                                            reinterpret_cast<BlockQ4X *>(Lp->up + e * Lp->stride)[i]);
                     }
                 }
                 if (Lp->dn == Down::IQ4L) {
                     const std::size_t src_row = 20 * sizeof(BlockIQ4_NL);
                     for (int r = 0; r < kEmbd; ++r)
-                        repack_iq4nl_row(reinterpret_cast<const BlockIQ4_NL *>(td.data + (std::size_t(e) * kEmbd + r) * src_row),
+                        repack_iq4nl_row(reinterpret_cast<const BlockIQ4_NL *>(dsrc + (std::size_t(e) * kEmbd + r) * src_row),
                                          reinterpret_cast<RowIQ4L *>(Lp->down + e * Lp->stride)[r]);
                 } else {
-                    std::memcpy(Lp->down + e * Lp->stride, td.data + e * Lp->dn_expert_bytes, Lp->dn_expert_bytes);
+                    std::memcpy(Lp->down + e * Lp->stride, dsrc + e * Lp->dn_expert_bytes, Lp->dn_expert_bytes);
                 }
             }
         });
