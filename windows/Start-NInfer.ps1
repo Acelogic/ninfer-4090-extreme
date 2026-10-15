@@ -35,7 +35,10 @@ $profileArgs = @($entry.args | ForEach-Object {
     if ($arg -match '\s') { '"' + $arg + '"' } else { $arg }
 })
 foreach ($required in $exe, $model) { if (-not (Test-Path -LiteralPath $required)) { throw "Missing: $required" } }
-if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) {
+# Only a listener on the loopback or wildcard address collides with the server's 127.0.0.1 bind: `tailscale serve`
+# listens on the same port on the Tailscale addresses to forward to the server, and that is not a running server.
+if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue |
+        Where-Object { $_.LocalAddress -in '127.0.0.1', '0.0.0.0', '::', '::1' }) {
     throw "Port $port is already in use. Stop the running server first (Stop-NInfer.ps1)."
 }
 New-Item -ItemType Directory -Force -Path (Join-Path $root 'logs') | Out-Null
